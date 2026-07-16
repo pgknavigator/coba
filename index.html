@@ -1,1 +1,1505 @@
+"use strict";
 
+/*
+  PGK Navigator - Core Logic Test Module
+  Siap copypaste untuk pengujian langsung.
+  Tidak memakai package eksternal.
+*/
+
+const crypto = require("crypto");
+
+/* =========================
+ * KONSTANTA
+ * ========================= */
+
+const ORDER_STATUS = Object.freeze({
+  SUBMIT_DONE: "submit_done",
+  MENUNGGU_REVIEW: "menunggu_review",
+  PROSES: "proses",
+  REVISI: "revisi",
+  DITOLAK: "ditolak",
+  SELESAI: "selesai",
+});
+
+const PAYMENT_STATUS = Object.freeze({
+  BELUM_BAYAR: "belum_bayar",
+  MENUNGGU_KONFIRMASI: "menunggu_konfirmasi",
+  SUDAH_BAYAR: "sudah_bayar",
+  EXPIRED: "expired",
+  BLOCKED: "blocked",
+});
+
+const APPLICANT_TYPE = Object.freeze({
+  PERORANGAN: "perorangan",
+  BADAN_USAHA: "badan_usaha",
+  KOLEKTIF: "kolektif",
+});
+
+const EVENT_TYPE = Object.freeze({
+  ORDER_CREATED: "order_created",
+  STATUS_CHANGED: "status_changed",
+  REVISION_REQUESTED: "revision_requested",
+  REVISION_RESUBMITTED: "revision_resubmitted",
+  PAYMENT_REQUEST_ISSUED: "payment_request_issued",
+  PAYMENT_CONFIRMED: "payment_confirmed",
+  DUPLICATE_DETECTED: "duplicate_detected",
+  ADMIN_NOTE_ADDED: "admin_note_added",
+  FILES_DELETE_STARTED: "files_delete_started",
+  FILES_DELETE_SUCCEEDED: "files_delete_succeeded",
+  FILES_DELETE_FAILED: "files_delete_failed",
+  TRACKING_CHECKED: "tracking_checked",
+});
+
+const ALLOWED_TRACKING_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ123456789"; // tanpa O dan 0
+const TRACKING_PREFIX = "PGK-";
+const TRACKING_SUFFIX_LENGTH = 8;
+const DOWNLOAD_VALID_DAYS = 7;
+const QRIS_VALID_HOURS = 24;
+const DEFAULT_SECRET_SALT = "PGK_SECRET_SALT_CHANGE_ME";
+
+const ALLOWED_TRANSITIONS = Object.freeze({
+  [ORDER_STATUS.SUBMIT_DONE]: [ORDER_STATUS.MENUNGGU_REVIEW],
+  [ORDER_STATUS.MENUNGGU_REVIEW]: [
+    ORDER_STATUS.PROSES,
+    ORDER_STATUS.REVISI,
+    ORDER_STATUS.DITOLAK,
+  ],
+  [ORDER_STATUS.PROSES]: [
+    ORDER_STATUS.REVISI,
+    ORDER_STATUS.DITOLAK,
+    ORDER_STATUS.SELESAI,
+  ],
+  [ORDER_STATUS.REVISI]: [ORDER_STATUS.PROSES, ORDER_STATUS.DITOLAK],
+  [ORDER_STATUS.DITOLAK]: [],
+  [ORDER_STATUS.SELESAI]: [],
+});
+
+const DEFAULT_SERVICE_CONFIGS = Object.freeze({
+  "nib-baru": {
+    serviceTypeId: "nib-baru",
+    name: "NIB Baru",
+    phase: "fase_1",
+    enabled: true,
+    allowedApplicantTypes: [
+      APPLICANT_TYPE.PERORANGAN,
+      APPLICANT_TYPE.BADAN_USAHA,
+      APPLICANT_TYPE.KOLEKTIF,
+    ],
+    requiredDocuments: {
+      [APPLICANT_TYPE.PERORANGAN]: ["ktp"],
+      [APPLICANT_TYPE.BADAN_USAHA]: ["ktp", "akta"],
+      [APPLICANT_TYPE.KOLEKTIF]: ["ktp"],
+    },
+    collectiveMode: {
+      allowedMemberCounts: [3, 5],
+      fixedThreeColumns: true,
+    },
+    pricing: {
+      perorangan: 100000,
+      kolektif3: null,
+      kolektif5: null,
+      dynamicManagedByAdmin: true,
+    },
+  },
+  "nib-tambah-kbli": {
+    serviceTypeId: "nib-tambah-kbli",
+    name: "NIB Tambah KBLI",
+    phase: "fase_1",
+    enabled: true,
+    allowedApplicantTypes: [
+      APPLICANT_TYPE.PERORANGAN,
+      APPLICANT_TYPE.BADAN_USAHA,
+    ],
+    requiredDocuments: {
+      [APPLICANT_TYPE.PERORANGAN]: ["ktp"],
+      [APPLICANT_TYPE.BADAN_USAHA]: ["ktp", "akta"],
+      [APPLICANT_TYPE.KOLEKTIF]: [],
+    },
+    collectiveMode: {
+      allowedMemberCounts: [3, 5],
+      fixedThreeColumns: true,
+    },
+    pricing: {
+      perorangan: 150000,
+      kolektif3: null,
+      kolektif5: null,
+      dynamicManagedByAdmin: true,
+    },
+  },
+});
+
+/* =========================
+ * UTILITAS DASAR
+ * ========================= */
+
+function nowDate() {
+  return new Date();
+}
+
+function cloneDate(date) {
+  return date ? new Date(date.getTime()) : null;
+}
+
+function addHours(date, hours) {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000);
+}
+
+function addDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function randomUUID() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function normalizeWhatsapp(input) {
+  const raw = String(input || "").trim();
+  let digits = raw.replace(/[^\d]/g, "");
+  if (digits.startsWith("62")) return digits;
+  if (digits.startsWith("0")) return `62${digits.slice(1)}`;
+  return digits;
+}
+
+function normalizeEmail(input) {
+  return String(input || "").trim().toLowerCase();
+}
+
+function normalizeIdentityNumber(input) {
+  return String(input || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function hashIdentity(identityNumber, secretSalt = DEFAULT_SECRET_SALT) {
+  const normalized = normalizeIdentityNumber(identityNumber);
+  return crypto
+    .createHash("sha256")
+    .update(`${secretSalt}|${normalized}`)
+    .digest("hex");
+}
+
+function assert(condition, message) {
+  if (!condition) {
+    throw new Error(message || "Assertion failed");
+  }
+}
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+/* =========================
+ * TRACKING CODE
+ * ========================= */
+
+function generateTrackingCode() {
+  let suffix = "";
+  for (let i = 0; i < TRACKING_SUFFIX_LENGTH; i++) {
+    const randomByte = crypto.randomBytes(1)[0];
+    suffix += ALLOWED_TRACKING_CHARS[randomByte % ALLOWED_TRACKING_CHARS.length];
+  }
+  return `${TRACKING_PREFIX}${suffix}`;
+}
+
+function generateUniqueTrackingCode(existingSet = new Set(), maxTry = 1000) {
+  for (let i = 0; i < maxTry; i++) {
+    const code = generateTrackingCode();
+    if (!existingSet.has(code)) {
+      existingSet.add(code);
+      return code;
+    }
+  }
+  throw new Error("Gagal membuat tracking code unik");
+}
+
+function isValidTrackingCodeFormat(code) {
+  const normalized = String(code || "").trim().toUpperCase();
+  return /^PGK-[A-NP-Z1-9]{8}$/.test(normalized);
+}
+
+/* =========================
+ * EVENT LOG
+ * ========================= */
+
+function createEvent(order, eventType, actor, detail = {}) {
+  const event = {
+    eventId: randomUUID(),
+    orderId: order.orderId,
+    eventType,
+    actor: {
+      type: actor?.type || "system",
+      actorId: actor?.actorId || "system",
+      actorEmail: actor?.actorEmail || null,
+    },
+    detail: deepClone(detail),
+    createdAt: nowDate().toISOString(),
+  };
+  order.events.push(event);
+  return event;
+}
+
+/* =========================
+ * VALIDASI SLOT FORM
+ * ========================= */
+
+function buildApplicantSlots(applicantType, memberCount) {
+  if (applicantType === APPLICANT_TYPE.KOLEKTIF) {
+    if (![3, 5].includes(memberCount)) {
+      throw new Error("Mode kolektif hanya boleh 3 atau 5 orang");
+    }
+    return Array.from({ length: memberCount }, (_, i) => ({
+      slotNo: i + 1,
+      requiresPhoto: true,
+      requiresName: true,
+      requiresIdentityNumber: true,
+    }));
+  }
+
+  return [
+    {
+      slotNo: 1,
+      requiresPhoto: true,
+      requiresName: true,
+      requiresIdentityNumber: true,
+    },
+  ];
+}
+
+function validateCustomer(customer) {
+  const errors = [];
+  if (!customer || !String(customer.fullName || "").trim()) {
+    errors.push("Nama pengaju wajib diisi");
+  }
+  if (!customer || !normalizeWhatsapp(customer.whatsapp)) {
+    errors.push("Nomor WhatsApp wajib diisi");
+  }
+  if (!customer || !normalizeEmail(customer.email)) {
+    errors.push("Email wajib diisi");
+  }
+  return errors;
+}
+
+function validateApplicantTypeAgainstService(serviceConfig, applicantType) {
+  if (!serviceConfig.allowedApplicantTypes.includes(applicantType)) {
+    return [`Jenis pemohon '${applicantType}' tidak diizinkan untuk layanan ini`];
+  }
+  return [];
+}
+
+function validateMembers(applicantType, memberCount, members) {
+  const errors = [];
+  const slots = buildApplicantSlots(applicantType, memberCount);
+
+  if (!Array.isArray(members)) {
+    return ["Data anggota harus berupa array"];
+  }
+
+  if (members.length !== slots.length) {
+    errors.push(
+      `Jumlah anggota tidak sesuai. Harus ${slots.length}, diterima ${members.length}`
+    );
+    return errors;
+  }
+
+  for (let i = 0; i < slots.length; i++) {
+    const member = members[i] || {};
+    const label = `Anggota ke-${i + 1}`;
+
+    if (!String(member.fullName || "").trim()) {
+      errors.push(`${label}: Nama lengkap wajib diisi`);
+    }
+    if (!normalizeIdentityNumber(member.identityNumber)) {
+      errors.push(`${label}: Nomor identitas wajib diisi`);
+    }
+    if (!member.file || !String(member.file.originalName || "").trim()) {
+      errors.push(`${label}: File dokumen wajib diunggah`);
+    }
+  }
+
+  return errors;
+}
+
+function validateConsent(consent, resetAssistanceEnabled = false) {
+  const errors = [];
+  if (!consent || consent.pdpAccepted !== true) {
+    errors.push("Consent perlindungan data wajib disetujui");
+  }
+
+  if (resetAssistanceEnabled && consent.resetSelfieAccepted !== true) {
+    errors.push("Consent selfie reset akun wajib disetujui");
+  }
+
+  return errors;
+}
+
+function validateOrderDraft(payload, serviceConfig) {
+  const errors = [];
+
+  if (!serviceConfig || serviceConfig.enabled !== true) {
+    errors.push("Layanan tidak aktif atau konfigurasi tidak ditemukan");
+    return { ok: false, errors };
+  }
+
+  errors.push(
+    ...validateApplicantTypeAgainstService(serviceConfig, payload.applicantType)
+  );
+  errors.push(...validateCustomer(payload.customer));
+  errors.push(
+    ...validateConsent(
+      payload.consent,
+      payload.resetAssistance?.enabled === true
+    )
+  );
+
+  if (
+    payload.applicantType === APPLICANT_TYPE.KOLEKTIF &&
+    !serviceConfig.collectiveMode.allowedMemberCounts.includes(payload.memberCount)
+  ) {
+    errors.push("Jumlah anggota kolektif tidak sesuai konfigurasi layanan");
+  }
+
+  errors.push(
+    ...validateMembers(
+      payload.applicantType,
+      payload.memberCount,
+      payload.members
+    )
+  );
+
+  return {
+    ok: errors.length === 0,
+    errors,
+  };
+}
+
+/* =========================
+ * FILE & SANITASI LOGIKA
+ * ========================= */
+
+function createFileRef({
+  orderId,
+  submissionId,
+  category,
+  originalName,
+  mimeType = "image/jpeg",
+  sizeBytes = 0,
+  ownerOnly = false,
+  storagePath = null,
+}) {
+  return {
+    fileRefId: randomUUID(),
+    orderId,
+    submissionId,
+    category,
+    originalName,
+    mimeType,
+    sizeBytes,
+    storagePath:
+      storagePath ||
+      `orders/${orderId}/${submissionId}/${category}/${Date.now()}-${originalName}`,
+    sanitize: {
+      status: "pending",
+      metadataStripped: false,
+      reEncoded: false,
+      finalMimeType: null,
+      finalSizeBytes: null,
+      sanitizeAttemptCount: 0,
+      sanitizeError: null,
+    },
+    access: {
+      ownerOnly,
+      visibleToAdditionalStaff: ownerOnly ? false : true,
+    },
+    retention: {
+      deleteOnFinish: ["ktp", "kk", "akta", "selfie_reset"].includes(category),
+      deleteOnRejectTotal: true,
+      deletedAt: null,
+      deleteVerifiedAt: null,
+    },
+  };
+}
+
+/*
+  Ini simulasi logika sanitasi.
+  Untuk produksi, Anda bisa ganti isi fungsi ini dengan sharp/image processor asli.
+*/
+function sanitizeUploadedFile(fileRef, { forceFail = false } = {}) {
+  fileRef.sanitize.sanitizeAttemptCount += 1;
+
+  if (forceFail) {
+    fileRef.sanitize.status = "failed";
+    fileRef.sanitize.sanitizeError = "Gagal sanitasi file";
+    return {
+      ok: false,
+      error: "Gagal sanitasi file",
+      fileRef,
+    };
+  }
+
+  fileRef.sanitize.status = "success";
+  fileRef.sanitize.metadataStripped = true;
+  fileRef.sanitize.reEncoded = true;
+  fileRef.sanitize.finalMimeType = "image/jpeg";
+  fileRef.sanitize.finalSizeBytes = Math.max(
+    Math.floor(fileRef.sizeBytes * 0.85),
+    1
+  );
+  fileRef.sanitize.sanitizeError = null;
+
+  return {
+    ok: true,
+    fileRef,
+  };
+}
+
+/* =========================
+ * ORDER FACTORY
+ * ========================= */
+
+function createOrder(payload, serviceConfig, options = {}) {
+  const existingTrackingCodes = options.existingTrackingCodes || new Set();
+  const secretSalt = options.secretSalt || DEFAULT_SECRET_SALT;
+  const currentNow = options.now || nowDate();
+
+  const validation = validateOrderDraft(payload, serviceConfig);
+  if (!validation.ok) {
+    throw new Error(`Validasi order gagal: ${validation.errors.join(" | ")}`);
+  }
+
+  const orderId = randomUUID();
+  const trackingCode = generateUniqueTrackingCode(existingTrackingCodes);
+
+  const submissionId = randomUUID();
+  const normalizedMembers = payload.members.map((member, index) => {
+    const category =
+      payload.applicantType === APPLICANT_TYPE.KOLEKTIF ? "ktp" : "ktp";
+
+    const fileRef = createFileRef({
+      orderId,
+      submissionId,
+      category,
+      originalName: member.file.originalName,
+      mimeType: member.file.mimeType || "image/jpeg",
+      sizeBytes: member.file.sizeBytes || 0,
+      ownerOnly: false,
+    });
+
+    return {
+      slotNo: index + 1,
+      fullName: String(member.fullName).trim(),
+      identityNumber: normalizeIdentityNumber(member.identityNumber),
+      identityHash: hashIdentity(member.identityNumber, secretSalt),
+      fileRef,
+      blurScore: member.blurScore ?? null,
+      ocrName: member.ocrName ?? null,
+      ocrIdentityNumber: member.ocrIdentityNumber ?? null,
+      crossCheckScore: member.crossCheckScore ?? null,
+    };
+  });
+
+  const resetSelfieFileRef =
+    payload.resetAssistance?.enabled && payload.resetAssistance?.selfieFile
+      ? createFileRef({
+          orderId,
+          submissionId,
+          category: "selfie_reset",
+          originalName: payload.resetAssistance.selfieFile.originalName,
+          mimeType: payload.resetAssistance.selfieFile.mimeType || "image/jpeg",
+          sizeBytes: payload.resetAssistance.selfieFile.sizeBytes || 0,
+          ownerOnly: true,
+        })
+      : null;
+
+  const order = {
+    orderId,
+    trackingCode,
+    trackingCodeUpper: trackingCode.toUpperCase(),
+    serviceTypeId: serviceConfig.serviceTypeId,
+    serviceTypeName: serviceConfig.name,
+    applicantType: payload.applicantType,
+    memberCount: payload.memberCount,
+    customer: {
+      fullName: String(payload.customer.fullName).trim(),
+      whatsapp: String(payload.customer.whatsapp).trim(),
+      email: String(payload.customer.email).trim(),
+      normalizedWhatsapp: normalizeWhatsapp(payload.customer.whatsapp),
+      normalizedEmail: normalizeEmail(payload.customer.email),
+    },
+    status: ORDER_STATUS.SUBMIT_DONE,
+    paymentStatus: PAYMENT_STATUS.BELUM_BAYAR,
+    orderFlowLocked: true,
+    resetAssistance: {
+      enabled: payload.resetAssistance?.enabled === true,
+      mode: payload.resetAssistance?.enabled ? "oss_npwp_reset" : "none",
+      biometricOwnerOnly: payload.resetAssistance?.enabled === true,
+      estimatedDaysMin: payload.resetAssistance?.enabled ? 3 : null,
+      estimatedDaysMax: payload.resetAssistance?.enabled ? 7 : null,
+    },
+    collectiveGroup: {
+      groupCode: null,
+      groupPricingRuleId: null,
+    },
+    duplicateIdentity: {
+      identityKeys: normalizedMembers.map((m) => m.identityHash),
+      isLockedForDuplicateSubmission: false,
+      duplicateReason: null,
+    },
+    timing: {
+      createdAt: cloneDate(currentNow),
+      updatedAt: cloneDate(currentNow),
+      submittedAt: cloneDate(currentNow),
+      reviewedAt: null,
+      processStartedAt: null,
+      revisedAt: null,
+      rejectedAt: null,
+      finishedAt: null,
+      paymentConfirmedAt: null,
+      downloadExpireAt: null,
+      qris1IssuedAt: null,
+      qris1ExpireAt: null,
+      qris2IssuedAt: null,
+      qris2ExpireAt: null,
+      blockEligibleAt: null,
+      blockedAt: null,
+    },
+    consent: {
+      pdpAccepted: true,
+      pdpAcceptedAt: cloneDate(currentNow),
+      resetSelfieAccepted: payload.consent?.resetSelfieAccepted === true,
+      resetSelfieAcceptedAt:
+        payload.consent?.resetSelfieAccepted === true ? cloneDate(currentNow) : null,
+      consentTextVersion: payload.consent?.consentTextVersion || "v1.14",
+    },
+    adminFlags: {
+      requiresManualReview: true,
+      requiresBlurReview: normalizedMembers.some(
+        (m) => typeof m.blurScore === "number" && m.blurScore < 0.6
+      ),
+      requiresIdentityCrossCheck: true,
+      deletionPending: false,
+      deletionVerified: false,
+    },
+    refs: {
+      currentSubmissionId: submissionId,
+      latestPaymentRequestId: null,
+    },
+    submissions: [
+      {
+        submissionId,
+        orderId,
+        revisionRound: 0,
+        sourceStatus: "submit_awal",
+        createdAt: cloneDate(currentNow),
+        applicantType: payload.applicantType,
+        memberCount: payload.memberCount,
+        members: normalizedMembers,
+        validation: {
+          allRequiredFieldsPresent: true,
+          allRequiredFilesPresent: true,
+          clientValidationPassed: true,
+          serverValidationPassed: true,
+        },
+        additionalFiles: resetSelfieFileRef ? [resetSelfieFileRef] : [],
+      },
+    ],
+    paymentRequests: [],
+    deletionLogs: [],
+    events: [],
+    adminNotes: [],
+  };
+
+  createEvent(order, EVENT_TYPE.ORDER_CREATED, {
+    type: "system",
+    actorId: "system",
+  });
+
+  return order;
+}
+
+/* =========================
+ * DUPLIKASI IDENTITAS
+ * ========================= */
+
+function detectDuplicateIdentity(order, existingOrders = []) {
+  const currentKeys = new Set(order.duplicateIdentity.identityKeys);
+
+  for (const other of existingOrders) {
+    if (!other || other.orderId === order.orderId) continue;
+    const otherKeys = other.duplicateIdentity?.identityKeys || [];
+    for (const key of otherKeys) {
+      if (currentKeys.has(key)) {
+        order.duplicateIdentity.isLockedForDuplicateSubmission = true;
+        order.duplicateIdentity.duplicateReason =
+          "Identitas terdeteksi sudah pernah digunakan";
+        createEvent(order, EVENT_TYPE.DUPLICATE_DETECTED, {
+          type: "system",
+          actorId: "system",
+        }, {
+          otherOrderId: other.orderId,
+          reason: order.duplicateIdentity.duplicateReason,
+        });
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/* =========================
+ * TRANSISI STATUS
+ * ========================= */
+
+function ensureAllowedTransition(currentStatus, nextStatus) {
+  const allowed = ALLOWED_TRANSITIONS[currentStatus] || [];
+  if (!allowed.includes(nextStatus)) {
+    throw new Error(
+      `Transisi status tidak sah: ${currentStatus} -> ${nextStatus}`
+    );
+  }
+}
+
+function updateStatus(order, nextStatus, actor, detail = {}) {
+  ensureAllowedTransition(order.status, nextStatus);
+
+  const prevStatus = order.status;
+  order.status = nextStatus;
+  order.timing.updatedAt = nowDate();
+
+  if (nextStatus === ORDER_STATUS.MENUNGGU_REVIEW) {
+    order.timing.reviewedAt = order.timing.reviewedAt || nowDate();
+  }
+  if (nextStatus === ORDER_STATUS.PROSES) {
+    order.timing.processStartedAt = nowDate();
+  }
+  if (nextStatus === ORDER_STATUS.REVISI) {
+    order.timing.revisedAt = nowDate();
+  }
+  if (nextStatus === ORDER_STATUS.DITOLAK) {
+    order.timing.rejectedAt = nowDate();
+  }
+  if (nextStatus === ORDER_STATUS.SELESAI) {
+    order.timing.finishedAt = nowDate();
+  }
+
+  createEvent(order, EVENT_TYPE.STATUS_CHANGED, actor, {
+    before: prevStatus,
+    after: nextStatus,
+    ...detail,
+  });
+
+  return order;
+}
+
+function moveToWaitingReview(order, actor = { type: "system", actorId: "system" }) {
+  assert(
+    order.status === ORDER_STATUS.SUBMIT_DONE,
+    "Order harus berada di submit_done"
+  );
+
+  const currentSubmission = order.submissions.find(
+    (x) => x.submissionId === order.refs.currentSubmissionId
+  );
+
+  assert(currentSubmission, "Submission aktif tidak ditemukan");
+  assert(
+    currentSubmission.validation.allRequiredFieldsPresent === true,
+    "Field wajib belum lengkap"
+  );
+  assert(
+    currentSubmission.validation.allRequiredFilesPresent === true,
+    "File wajib belum lengkap"
+  );
+  assert(
+    currentSubmission.validation.serverValidationPassed === true,
+    "Validasi server belum lolos"
+  );
+
+  updateStatus(order, ORDER_STATUS.MENUNGGU_REVIEW, actor);
+  return order;
+}
+
+function triggerProcess(order, actor, { reason = "Review lolos" } = {}) {
+  assert(
+    [ORDER_STATUS.MENUNGGU_REVIEW, ORDER_STATUS.REVISI].includes(order.status),
+    "Order hanya bisa masuk proses dari menunggu_review atau revisi"
+  );
+
+  updateStatus(order, ORDER_STATUS.PROSES, actor, { reason });
+  return order;
+}
+
+function triggerRevision(order, actor, { reason }) {
+  assert(
+    [ORDER_STATUS.MENUNGGU_REVIEW, ORDER_STATUS.PROSES].includes(order.status),
+    "Revisi hanya bisa dipicu dari menunggu_review atau proses"
+  );
+  assert(reason && String(reason).trim(), "Alasan revisi wajib diisi");
+
+  const previousStatus = order.status;
+  updateStatus(order, ORDER_STATUS.REVISI, actor, { reason });
+  createEvent(order, EVENT_TYPE.REVISION_REQUESTED, actor, {
+    from: previousStatus,
+    reason,
+    keepOriginalFilesAsComparison: true,
+  });
+
+  return order;
+}
+
+function resubmitRevision(order, actor, revisionPayload) {
+  assert(order.status === ORDER_STATUS.REVISI, "Order tidak berada di status revisi");
+  const currentSubmission = order.submissions.find(
+    (x) => x.submissionId === order.refs.currentSubmissionId
+  );
+  assert(currentSubmission, "Submission aktif tidak ditemukan");
+
+  const nextRound = Math.max(...order.submissions.map((x) => x.revisionRound)) + 1;
+  const submissionId = randomUUID();
+
+  const members = revisionPayload.members.map((member, index) => ({
+    slotNo: index + 1,
+    fullName: String(member.fullName).trim(),
+    identityNumber: normalizeIdentityNumber(member.identityNumber),
+    identityHash: hashIdentity(member.identityNumber, revisionPayload.secretSalt),
+    fileRef: createFileRef({
+      orderId: order.orderId,
+      submissionId,
+      category: "ktp",
+      originalName: member.file.originalName,
+      mimeType: member.file.mimeType || "image/jpeg",
+      sizeBytes: member.file.sizeBytes || 0,
+      ownerOnly: false,
+    }),
+    blurScore: member.blurScore ?? null,
+    ocrName: member.ocrName ?? null,
+    ocrIdentityNumber: member.ocrIdentityNumber ?? null,
+    crossCheckScore: member.crossCheckScore ?? null,
+  }));
+
+  const newSubmission = {
+    submissionId,
+    orderId: order.orderId,
+    revisionRound: nextRound,
+    sourceStatus: "revisi",
+    createdAt: nowDate(),
+    applicantType: order.applicantType,
+    memberCount: order.memberCount,
+    members,
+    validation: {
+      allRequiredFieldsPresent: true,
+      allRequiredFilesPresent: true,
+      clientValidationPassed: true,
+      serverValidationPassed: true,
+    },
+    additionalFiles: [],
+  };
+
+  order.submissions.push(newSubmission);
+  order.refs.currentSubmissionId = submissionId;
+  order.timing.updatedAt = nowDate();
+
+  createEvent(order, EVENT_TYPE.REVISION_RESUBMITTED, actor, {
+    revisionRound: nextRound,
+  });
+
+  return order;
+}
+
+function triggerReject(order, actor, { reason, rejectTotal = false }) {
+  assert(
+    [ORDER_STATUS.MENUNGGU_REVIEW, ORDER_STATUS.PROSES, ORDER_STATUS.REVISI].includes(order.status),
+    "Order tidak bisa ditolak dari status saat ini"
+  );
+  assert(reason && String(reason).trim(), "Alasan penolakan wajib diisi");
+
+  updateStatus(order, ORDER_STATUS.DITOLAK, actor, {
+    reason,
+    rejectTotal,
+  });
+
+  if (rejectTotal) {
+    order.adminFlags.deletionPending = true;
+    scheduleDeletion(order, "ditolak_total", actor);
+  }
+
+  return order;
+}
+
+function triggerFinish(order, actor, { amount }) {
+  assert(order.status === ORDER_STATUS.PROSES, "Order harus berada di status proses");
+  assert(Number(amount) > 0, "Nominal QRIS wajib lebih dari 0");
+
+  updateStatus(order, ORDER_STATUS.SELESAI, actor, {
+    reason: "Pekerjaan selesai",
+  });
+
+  issueFirstQris(order, amount, actor);
+  order.adminFlags.deletionPending = true; // jalur retensi aktif
+
+  return order;
+}
+
+/* =========================
+ * QRIS & PEMBAYARAN
+ * ========================= */
+
+function issuePaymentRequest(order, amount, sequence, mode, actor, issuedAt = nowDate()) {
+  const request = {
+    paymentRequestId: randomUUID(),
+    orderId: order.orderId,
+    sequence,
+    mode,
+    amount,
+    issuedAt: cloneDate(issuedAt),
+    expireAt: mode === "qris_tagih" ? addHours(issuedAt, QRIS_VALID_HOURS) : null,
+    status: "issued",
+    blockedIfExpired: sequence === 1 || sequence === 2,
+  };
+
+  order.paymentRequests.push(request);
+  order.refs.latestPaymentRequestId = request.paymentRequestId;
+  order.paymentStatus = PAYMENT_STATUS.MENUNGGU_KONFIRMASI;
+
+  createEvent(order, EVENT_TYPE.PAYMENT_REQUEST_ISSUED, actor, {
+    paymentRequestId: request.paymentRequestId,
+    sequence,
+    mode,
+    amount,
+  });
+
+  return request;
+}
+
+function issueFirstQris(order, amount, actor, issuedAt = nowDate()) {
+  assert(order.status === ORDER_STATUS.SELESAI, "QRIS pertama hanya boleh saat status selesai");
+  assert(order.paymentRequests.length === 0, "QRIS pertama sudah pernah diterbitkan");
+
+  const request = issuePaymentRequest(order, amount, 1, "qris_tagih", actor, issuedAt);
+  order.timing.qris1IssuedAt = cloneDate(request.issuedAt);
+  order.timing.qris1ExpireAt = cloneDate(request.expireAt);
+  order.timing.blockEligibleAt = null;
+
+  return request;
+}
+
+function markExpiredPaymentRequests(order, currentNow = nowDate()) {
+  for (const request of order.paymentRequests) {
+    if (
+      request.status === "issued" &&
+      request.expireAt &&
+      currentNow.getTime() > request.expireAt.getTime()
+    ) {
+      request.status = "expired";
+    }
+  }
+}
+
+function requestSecondQris(order, actor, currentNow = nowDate()) {
+  assert(order.status === ORDER_STATUS.SELESAI, "QRIS kedua hanya boleh untuk order selesai");
+  assert(
+    order.paymentStatus !== PAYMENT_STATUS.SUDAH_BAYAR,
+    "Order sudah dibayar, QRIS kedua tidak boleh dibuat"
+  );
+
+  markExpiredPaymentRequests(order, currentNow);
+
+  const first = order.paymentRequests.find((x) => x.sequence === 1);
+  assert(first, "QRIS pertama belum ada");
+  assert(first.status === "expired", "QRIS pertama belum expired");
+
+  const second = order.paymentRequests.find((x) => x.sequence === 2);
+  assert(!second, "QRIS kedua sudah pernah diterbitkan");
+
+  const request = issuePaymentRequest(order, first.amount, 2, "qris_tagih", actor, currentNow);
+  order.timing.qris2IssuedAt = cloneDate(request.issuedAt);
+  order.timing.qris2ExpireAt = cloneDate(request.expireAt);
+  order.timing.blockEligibleAt = cloneDate(request.expireAt);
+
+  return request;
+}
+
+function confirmPayment(order, actor, currentNow = nowDate()) {
+  assert(order.status === ORDER_STATUS.SELESAI, "Pembayaran hanya bisa dikonfirmasi saat status selesai");
+
+  const latestIssued = [...order.paymentRequests]
+    .reverse()
+    .find((x) => x.status === "issued" || x.status === "expired");
+
+  assert(latestIssued, "Tidak ada permintaan pembayaran yang bisa dikonfirmasi");
+
+  latestIssued.status = "paid";
+  order.paymentStatus = PAYMENT_STATUS.SUDAH_BAYAR;
+  order.timing.paymentConfirmedAt = cloneDate(currentNow);
+  order.timing.downloadExpireAt = addDays(currentNow, DOWNLOAD_VALID_DAYS);
+
+  createEvent(order, EVENT_TYPE.PAYMENT_CONFIRMED, actor, {
+    paymentRequestId: latestIssued.paymentRequestId,
+    sequence: latestIssued.sequence,
+  });
+
+  return order;
+}
+
+function hasSuccessfulPayment(order) {
+  return order.paymentStatus === PAYMENT_STATUS.SUDAH_BAYAR;
+}
+
+function hasManualOverride(order) {
+  return order.adminNotes.some((x) => x.type === "manual_override_unblock");
+}
+
+function canAutoBlock(order, currentNow = nowDate()) {
+  markExpiredPaymentRequests(order, currentNow);
+
+  if (hasSuccessfulPayment(order)) return false;
+  if (hasManualOverride(order)) return false;
+  if (!order.timing.qris2ExpireAt) return false;
+  if (currentNow.getTime() <= order.timing.qris2ExpireAt.getTime()) return false;
+
+  const second = order.paymentRequests.find((x) => x.sequence === 2);
+  if (!second || second.status !== "expired") return false;
+
+  return true;
+}
+
+function applyAutoBlock(order, actor, currentNow = nowDate()) {
+  assert(canAutoBlock(order, currentNow), "Order belum memenuhi syarat blokir otomatis");
+
+  order.paymentStatus = PAYMENT_STATUS.BLOCKED;
+  order.timing.blockedAt = cloneDate(currentNow);
+  order.timing.updatedAt = cloneDate(currentNow);
+
+  order.adminNotes.push({
+    noteId: randomUUID(),
+    type: "auto_block",
+    text: "Akses diblokir otomatis setelah QRIS kedua expired",
+    createdAt: currentNow.toISOString(),
+  });
+
+  createEvent(order, EVENT_TYPE.ADMIN_NOTE_ADDED, actor, {
+    noteType: "auto_block",
+  });
+
+  return order;
+}
+
+function canDownloadFinalDocument(order, currentNow = nowDate()) {
+  if (order.status !== ORDER_STATUS.SELESAI) return false;
+  if (order.paymentStatus !== PAYMENT_STATUS.SUDAH_BAYAR) return false;
+  if (!order.timing.downloadExpireAt) return false;
+  return currentNow.getTime() <= order.timing.downloadExpireAt.getTime();
+}
+
+/* =========================
+ * PESAN WHATSAPP
+ * ========================= */
+
+function buildWhatsappDraft(order, type, extra = {}) {
+  const code = order.trackingCode;
+  const service = order.serviceTypeName;
+  const customerName = order.customer.fullName;
+
+  const templates = {
+    menunggu_review: [
+      `Halo ${customerName},`,
+      `Pengajuan ${service} sudah kami terima.`,
+      `Kode Tracking Anda: ${code}`,
+      `Status saat ini: Menunggu Review.`,
+      `Simpan kode ini untuk pemantauan status.`,
+    ],
+    revisi: [
+      `Halo ${customerName},`,
+      `Pengajuan ${service} memerlukan revisi.`,
+      `Kode Tracking: ${code}`,
+      `Catatan admin: ${extra.reason || "Mohon lengkapi dokumen yang diminta."}`,
+      `Silakan kirim perbaikan sesuai instruksi.`,
+    ],
+    ditolak: [
+      `Halo ${customerName},`,
+      `Pengajuan ${service} tidak dapat dilanjutkan.`,
+      `Kode Tracking: ${code}`,
+      `Alasan: ${extra.reason || "Tidak disebutkan."}`,
+      `Jika perlu, hubungi WhatsApp resmi dengan menyebutkan kode tracking.`,
+    ],
+    selesai: [
+      `Halo ${customerName},`,
+      `Pengajuan ${service} sudah selesai dikerjakan.`,
+      `Kode Tracking: ${code}`,
+      `Silakan lakukan pembayaran sesuai QRIS yang kami kirim.`,
+      `Dokumen hasil akan tersedia setelah pembayaran dikonfirmasi.`,
+    ],
+    pembayaran_terkonfirmasi: [
+      `Halo ${customerName},`,
+      `Pembayaran untuk ${service} sudah kami konfirmasi.`,
+      `Kode Tracking: ${code}`,
+      `Dokumen hasil dapat diakses sampai ${order.timing.downloadExpireAt?.toISOString() || "-"}.`,
+    ],
+  };
+
+  return (templates[type] || []).join("\n");
+}
+
+/* =========================
+ * JADWAL HAPUS & EKSEKUSI HAPUS
+ * ========================= */
+
+function scheduleDeletion(order, triggeredByStatus, actor) {
+  const currentSubmission = order.submissions.find(
+    (x) => x.submissionId === order.refs.currentSubmissionId
+  );
+
+  const targets = [];
+  for (const submission of order.submissions) {
+    for (const member of submission.members) {
+      targets.push({
+        fileRefId: member.fileRef.fileRefId,
+        storagePath: member.fileRef.storagePath,
+        category: member.fileRef.category,
+        deleted: false,
+        verified: false,
+        error: null,
+      });
+    }
+    for (const file of submission.additionalFiles || []) {
+      targets.push({
+        fileRefId: file.fileRefId,
+        storagePath: file.storagePath,
+        category: file.category,
+        deleted: false,
+        verified: false,
+        error: null,
+      });
+    }
+  }
+
+  const log = {
+    deletionLogId: randomUUID(),
+    orderId: order.orderId,
+    triggeredByStatus,
+    startedAt: nowDate(),
+    completedAt: null,
+    status: "pending",
+    attemptCount: 0,
+    targets,
+  };
+
+  order.deletionLogs.push(log);
+  createEvent(order, EVENT_TYPE.FILES_DELETE_STARTED, actor, {
+    deletionLogId: log.deletionLogId,
+    targetCount: targets.length,
+    currentSubmissionId: currentSubmission?.submissionId || null,
+  });
+
+  return log;
+}
+
+class InMemoryStorage {
+  constructor(paths = []) {
+    this.files = new Set(paths);
+  }
+
+  put(path) {
+    this.files.add(path);
+  }
+
+  async delete(path) {
+    if (!this.files.has(path)) {
+      throw new Error(`File tidak ditemukan: ${path}`);
+    }
+    this.files.delete(path);
+    return true;
+  }
+
+  async exists(path) {
+    return this.files.has(path);
+  }
+}
+
+async function executeDeletionPlan(order, actor, storage, options = {}) {
+  const log = order.deletionLogs[order.deletionLogs.length - 1];
+  assert(log, "Tidak ada deletion log aktif");
+
+  log.attemptCount += 1;
+  let allSuccess = true;
+
+  for (const target of log.targets) {
+    try {
+      await storage.delete(target.storagePath);
+      const stillExists = await storage.exists(target.storagePath);
+
+      target.deleted = !stillExists;
+      target.verified = !stillExists;
+      target.error = null;
+
+      if (stillExists) {
+        allSuccess = false;
+        target.error = "Verifikasi hapus gagal";
+      }
+    } catch (err) {
+      allSuccess = false;
+      target.deleted = false;
+      target.verified = false;
+      target.error = String(err.message || err);
+    }
+  }
+
+  log.completedAt = nowDate();
+  log.status = allSuccess ? "success" : "partial_failed";
+  order.adminFlags.deletionVerified = allSuccess;
+  order.adminFlags.deletionPending = !allSuccess;
+
+  createEvent(
+    order,
+    allSuccess
+      ? EVENT_TYPE.FILES_DELETE_SUCCEEDED
+      : EVENT_TYPE.FILES_DELETE_FAILED,
+    actor,
+    {
+      deletionLogId: log.deletionLogId,
+      status: log.status,
+      attemptCount: log.attemptCount,
+    }
+  );
+
+  return log;
+}
+
+/* =========================
+ * CROSS-CHECK DATA MANUAL VS FOTO
+ * ========================= */
+
+function scoreIdentityCrossCheck({
+  manualName,
+  manualIdentityNumber,
+  ocrName,
+  ocrIdentityNumber,
+}) {
+  const manualNameNorm = String(manualName || "").trim().toUpperCase();
+  const ocrNameNorm = String(ocrName || "").trim().toUpperCase();
+  const manualIdNorm = normalizeIdentityNumber(manualIdentityNumber);
+  const ocrIdNorm = normalizeIdentityNumber(ocrIdentityNumber);
+
+  let score = 0;
+
+  if (manualNameNorm && ocrNameNorm && manualNameNorm === ocrNameNorm) {
+    score += 0.5;
+  }
+
+  if (manualIdNorm && ocrIdNorm && manualIdNorm === ocrIdNorm) {
+    score += 0.5;
+  }
+
+  return Number(score.toFixed(2));
+}
+
+function shouldForceRevisionByCrossCheck(score) {
+  return score < 0.8;
+}
+
+/* =========================
+ * TEST CASES
+ * ========================= */
+
+function samplePayloadPerorangan() {
+  return {
+    applicantType: APPLICANT_TYPE.PERORANGAN,
+    memberCount: 1,
+    customer: {
+      fullName: "Budi Santoso",
+      whatsapp: "081234567890",
+      email: "budi@mail.com",
+    },
+    consent: {
+      pdpAccepted: true,
+      resetSelfieAccepted: false,
+      consentTextVersion: "v1.14",
+    },
+    resetAssistance: {
+      enabled: false,
+    },
+    members: [
+      {
+        fullName: "Budi Santoso",
+        identityNumber: "3174010101010001",
+        file: {
+          originalName: "ktp-budi.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 300000,
+        },
+      },
+    ],
+  };
+}
+
+function samplePayloadKolektif3() {
+  return {
+    applicantType: APPLICANT_TYPE.KOLEKTIF,
+    memberCount: 3,
+    customer: {
+      fullName: "Koordinator Kelompok",
+      whatsapp: "081111111111",
+      email: "grup@mail.com",
+    },
+    consent: {
+      pdpAccepted: true,
+      resetSelfieAccepted: false,
+      consentTextVersion: "v1.14",
+    },
+    resetAssistance: {
+      enabled: false,
+    },
+    members: [
+      {
+        fullName: "Anggota 1",
+        identityNumber: "3174010101010001",
+        file: {
+          originalName: "ktp-1.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 200000,
+        },
+      },
+      {
+        fullName: "Anggota 2",
+        identityNumber: "3174010101010002",
+        file: {
+          originalName: "ktp-2.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 210000,
+        },
+      },
+      {
+        fullName: "Anggota 3",
+        identityNumber: "3174010101010003",
+        file: {
+          originalName: "ktp-3.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 220000,
+        },
+      },
+    ],
+  };
+}
+
+function runAllTests() {
+  console.log("Menjalankan pengujian PGK core logic...");
+
+  const service = DEFAULT_SERVICE_CONFIGS["nib-baru"];
+  const trackingSet = new Set();
+
+  // 1. tracking code
+  const code = generateUniqueTrackingCode(trackingSet);
+  assert(isValidTrackingCodeFormat(code), "Tracking code format tidak valid");
+  assert(!code.includes("O"), "Tracking code mengandung O");
+  assert(!code.includes("0"), "Tracking code mengandung 0");
+
+  // 2. validasi perorangan
+  const validDraft = validateOrderDraft(samplePayloadPerorangan(), service);
+  assert(validDraft.ok === true, "Draft perorangan seharusnya valid");
+
+  // 3. validasi kolektif 3
+  const validKolektif = validateOrderDraft(samplePayloadKolektif3(), service);
+  assert(validKolektif.ok === true, "Draft kolektif 3 seharusnya valid");
+
+  // 4. kolektif 4 harus gagal
+  const badCollective = samplePayloadKolektif3();
+  badCollective.memberCount = 4;
+  const badCollectiveResult = validateOrderDraft(badCollective, service);
+  assert(badCollectiveResult.ok === false, "Kolektif 4 harus gagal");
+
+  // 5. create order
+  const order = createOrder(samplePayloadPerorangan(), service, {
+    existingTrackingCodes: trackingSet,
+  });
+  assert(order.status === ORDER_STATUS.SUBMIT_DONE, "Status awal harus submit_done");
+
+  // 6. sanitasi file sukses
+  const currentSubmission = order.submissions[0];
+  const fileRef = currentSubmission.members[0].fileRef;
+  const sanitizeResult = sanitizeUploadedFile(fileRef);
+  assert(sanitizeResult.ok === true, "Sanitasi file seharusnya sukses");
+  assert(fileRef.sanitize.status === "success", "Status sanitasi harus success");
+
+  // 7. state machine basic
+  moveToWaitingReview(order);
+  assert(
+    order.status === ORDER_STATUS.MENUNGGU_REVIEW,
+    "Harus pindah ke menunggu_review"
+  );
+
+  triggerProcess(order, { type: "project_owner", actorId: "po-1" });
+  assert(order.status === ORDER_STATUS.PROSES, "Harus pindah ke proses");
+
+  triggerRevision(order, { type: "project_owner", actorId: "po-1" }, {
+    reason: "Foto buram",
+  });
+  assert(order.status === ORDER_STATUS.REVISI, "Harus pindah ke revisi");
+
+  resubmitRevision(order, { type: "user", actorId: "user-1" }, {
+    secretSalt: DEFAULT_SECRET_SALT,
+    members: [
+      {
+        fullName: "Budi Santoso",
+        identityNumber: "3174010101010001",
+        file: {
+          originalName: "ktp-budi-revisi.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 250000,
+        },
+      },
+    ],
+  });
+
+  triggerProcess(order, { type: "project_owner", actorId: "po-1" }, {
+    reason: "Revisi diterima",
+  });
+  assert(order.status === ORDER_STATUS.PROSES, "Harus balik ke proses");
+
+  // 8. finish -> issue QRIS 1
+  triggerFinish(order, { type: "project_owner", actorId: "po-1" }, {
+    amount: 100000,
+  });
+  assert(order.status === ORDER_STATUS.SELESAI, "Harus pindah ke selesai");
+  assert(order.paymentRequests.length === 1, "QRIS pertama harus dibuat");
+  assert(order.paymentRequests[0].sequence === 1, "Sequence pertama harus 1");
+
+  // 9. QRIS 2 sebelum expired harus gagal
+  let secondBeforeExpiredFailed = false;
+  try {
+    requestSecondQris(order, { type: "project_owner", actorId: "po-1" }, nowDate());
+  } catch (err) {
+    secondBeforeExpiredFailed = true;
+  }
+  assert(secondBeforeExpiredFailed, "QRIS 2 sebelum expired harus gagal");
+
+  // 10. QRIS 2 setelah expired
+  const afterFirstExpired = addHours(order.timing.qris1ExpireAt, 1);
+  requestSecondQris(order, { type: "project_owner", actorId: "po-1" }, afterFirstExpired);
+  assert(order.paymentRequests.length === 2, "QRIS kedua harus dibuat");
+  assert(order.paymentRequests[1].sequence === 2, "Sequence kedua harus 2");
+
+  // 11. auto block setelah QRIS kedua expired
+  const afterSecondExpired = addHours(order.timing.qris2ExpireAt, 1);
+  assert(canAutoBlock(order, afterSecondExpired) === true, "Harus memenuhi syarat auto block");
+
+  applyAutoBlock(order, { type: "system", actorId: "scheduler" }, afterSecondExpired);
+  assert(order.paymentStatus === PAYMENT_STATUS.BLOCKED, "Order harus blocked");
+
+  // 12. order baru untuk test pembayaran sukses
+  const order2 = createOrder(samplePayloadPerorangan(), service, {
+    existingTrackingCodes: trackingSet,
+  });
+  sanitizeUploadedFile(order2.submissions[0].members[0].fileRef);
+  moveToWaitingReview(order2);
+  triggerProcess(order2, { type: "project_owner", actorId: "po-1" });
+  triggerFinish(order2, { type: "project_owner", actorId: "po-1" }, { amount: 100000 });
+
+  const payNow = addHours(order2.timing.qris1IssuedAt, 2);
+  confirmPayment(order2, { type: "project_owner", actorId: "po-1" }, payNow);
+  assert(order2.paymentStatus === PAYMENT_STATUS.SUDAH_BAYAR, "Pembayaran harus sukses");
+  assert(!!order2.timing.downloadExpireAt, "Download expire harus terisi");
+  assert(canDownloadFinalDocument(order2, addDays(payNow, 6)) === true, "Hari ke-6 harus masih bisa unduh");
+  assert(canDownloadFinalDocument(order2, addDays(payNow, 8)) === false, "Hari ke-8 harus tidak bisa unduh");
+
+  // 13. duplicate detection
+  const order3 = createOrder(samplePayloadPerorangan(), service, {
+    existingTrackingCodes: trackingSet,
+  });
+  const dup = detectDuplicateIdentity(order3, [order2]);
+  assert(dup === true, "Duplikasi identitas harus terdeteksi");
+
+  // 14. cross-check
+  const scoreOk = scoreIdentityCrossCheck({
+    manualName: "Budi Santoso",
+    manualIdentityNumber: "3174010101010001",
+    ocrName: "BUDI SANTOSO",
+    ocrIdentityNumber: "3174010101010001",
+  });
+  assert(scoreOk === 1, "Skor cocok penuh harus 1");
+
+  const scoreBad = scoreIdentityCrossCheck({
+    manualName: "Budi Santoso",
+    manualIdentityNumber: "3174010101010001",
+    ocrName: "Slamet",
+    ocrIdentityNumber: "9999999999999999",
+  });
+  assert(shouldForceRevisionByCrossCheck(scoreBad) === true, "Mismatch harus memicu revisi");
+
+  // 15. deletion success
+  const storagePaths = [];
+  for (const submission of order2.submissions) {
+    for (const member of submission.members) {
+      storagePaths.push(member.fileRef.storagePath);
+    }
+    for (const f of submission.additionalFiles || []) {
+      storagePaths.push(f.storagePath);
+    }
+  }
+  const storage = new InMemoryStorage(storagePaths);
+
+  scheduleDeletion(order2, "selesai", { type: "project_owner", actorId: "po-1" });
+
+  executeDeletionPlan(order2, { type: "system", actorId: "worker-delete" }, storage)
+    .then((log) => {
+      assert(log.status === "success", "Deletion harus sukses");
+      assert(order2.adminFlags.deletionVerified === true, "Deletion harus terverifikasi");
+      console.log("Semua pengujian lulus.");
+    })
+    .catch((err) => {
+      console.error("Pengujian deletion gagal:", err);
+      process.exit(1);
+    });
+}
+
+/* =========================
+ * EXPORT
+ * ========================= */
+
+module.exports = {
+  ORDER_STATUS,
+  PAYMENT_STATUS,
+  APPLICANT_TYPE,
+  EVENT_TYPE,
+  DEFAULT_SERVICE_CONFIGS,
+  buildApplicantSlots,
+  validateOrderDraft,
+  sanitizeUploadedFile,
+  generateTrackingCode,
+  generateUniqueTrackingCode,
+  isValidTrackingCodeFormat,
+  createOrder,
+  detectDuplicateIdentity,
+  moveToWaitingReview,
+  triggerProcess,
+  triggerRevision,
+  resubmitRevision,
+  triggerReject,
+  triggerFinish,
+  issueFirstQris,
+  requestSecondQris,
+  confirmPayment,
+  canAutoBlock,
+  applyAutoBlock,
+  canDownloadFinalDocument,
+  buildWhatsappDraft,
+  scheduleDeletion,
+  executeDeletionPlan,
+  InMemoryStorage,
+  scoreIdentityCrossCheck,
+  shouldForceRevisionByCrossCheck,
+  hashIdentity,
+  normalizeIdentityNumber,
+  normalizeWhatsapp,
+  normalizeEmail,
+  runAllTests,
+};
+
+/* =========================
+ * EKSEKUSI LANGSUNG
+ * ========================= */
+
+if (require.main === module) {
+  runAllTests();
+}
